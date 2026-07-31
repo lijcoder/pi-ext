@@ -229,8 +229,6 @@ export default function permissionRulesExtension(pi: ExtensionAPI) {
 
 	function reload(ctx: ExtensionContext) {
 		config = loadConfig(ctx.cwd);
-		const total = config.deny.length + config.allow.length + config.ask.length;
-		ctx.ui.notify(`permission-rules: ${total} rules loaded (default: ${config.default})`, "info");
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -276,7 +274,7 @@ export default function permissionRulesExtension(pi: ExtensionAPI) {
 		}
 
 		// ask (interactive only — non-UI handled at the top of the handler)
-		const choice = await ctx.ui.select(`Run ${tool}?\n\n  ${subject}${entry ? `\n\n(rule: ${entry.source})` : ""}`, [
+		const choice = await ctx.ui.select(`Run ${tool}?\n\n  ${subject}`, [
 			"Yes, allow once",
 			"No, block",
 		]);
