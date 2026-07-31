@@ -7,7 +7,7 @@
  * (read/edit/write/grep/find/ls) using glob patterns.
  *
  * Config locations (project overrides global):
- *   ~/.pi/agent/permission-rules.json   (global)
+ *   ~/.pi/agent/extensions/permission-rules.json   (global)
  *   .pi/permission-rules.json           (project-local, trusted projects only)
  *
  * Config schema:
@@ -156,7 +156,7 @@ function parseConfig(raw: unknown): ParsedConfig {
 }
 
 function loadConfig(cwd: string): ParsedConfig {
-	const globalPath = join(getAgentDir(), "permission-rules.json");
+	const globalPath = join(getAgentDir(), "extensions", "permission-rules.json");
 	const projectPath = join(cwd, CONFIG_DIR_NAME, "permission-rules.json");
 
 	let global: ParsedConfig | undefined;
