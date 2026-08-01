@@ -46,7 +46,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { type BashOperations, CONFIG_DIR_NAME, createBashTool, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { type BashOperations, CONFIG_DIR_NAME, createBashTool, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 
 interface SandboxConfig extends SandboxRuntimeConfig {
 	enabled?: boolean;
@@ -69,7 +69,7 @@ const DEFAULT_CONFIG: SandboxConfig = {
 	},
 };
 
-function loadConfig(cwd: string): SandboxConfig {
+function loadConfig(cwd: string, warn?: (message: string) => void): SandboxConfig {
 	const projectConfigPath = join(cwd, CONFIG_DIR_NAME, "sandbox.json");
 	const globalConfigPath = join(getAgentDir(), "extensions", "sandbox.json");
 
@@ -80,7 +80,7 @@ function loadConfig(cwd: string): SandboxConfig {
 		try {
 			globalConfig = JSON.parse(readFileSync(globalConfigPath, "utf-8"));
 		} catch (e) {
-			console.error(`Warning: Could not parse ${globalConfigPath}: ${e}`);
+			warn?.(`Sandbox global config parse failed: ${globalConfigPath}: ${e instanceof Error ? e.message : e}`);
 		}
 	}
 
@@ -88,7 +88,7 @@ function loadConfig(cwd: string): SandboxConfig {
 		try {
 			projectConfig = JSON.parse(readFileSync(projectConfigPath, "utf-8"));
 		} catch (e) {
-			console.error(`Warning: Could not parse ${projectConfigPath}: ${e}`);
+			warn?.(`Sandbox project config parse failed: ${projectConfigPath}: ${e instanceof Error ? e.message : e}`);
 		}
 	}
 
@@ -203,19 +203,25 @@ export default function (pi: ExtensionAPI) {
 
 	let sandboxEnabled = false;
 	let sandboxInitialized = false;
+	// Cached SettingsManager + captured prefix, refreshed once per session
+	// (session_start fires on startup and /reload — same lifecycle point where
+	// pi itself reloads settings). Tool execution only touches in-memory values,
+	// no file I/O.
+	let settings: SettingsManager | undefined;
+	let shellCommandPrefix: string | undefined;
 
 	pi.registerTool({
 		...localBash,
 		label: "bash (sandboxed)",
 		async execute(id, params, signal, onUpdate, _ctx) {
-			if (!sandboxEnabled || !sandboxInitialized) {
-				return localBash.execute(id, params, signal, onUpdate);
-			}
-
-			const sandboxedBash = createBashTool(localCwd, {
-				operations: createSandboxedBashOps(),
+			// pi only injects shellCommandPrefix into its own built-in tool, so
+			// our replacement must apply it itself. Value is fixed per session,
+			// matching how pi's own bash tool captures it at session start.
+			const bash = createBashTool(localCwd, {
+				commandPrefix: shellCommandPrefix,
+				operations: sandboxEnabled && sandboxInitialized ? createSandboxedBashOps() : undefined,
 			});
-			return sandboxedBash.execute(id, params, signal, onUpdate);
+			return bash.execute(id, params, signal, onUpdate);
 		},
 	});
 
@@ -225,6 +231,20 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		// Refresh pi settings once per session (matches pi's own lifecycle:
+		// settingsManager.reload() runs at session start and on /reload, so
+		// mid-session file edits aren't picked up by pi itself either).
+		// Mirror project-trust handling so an untrusted project's .pi/settings.json
+		// is ignored, exactly like pi's runtime does.
+		try {
+			settings ??= SettingsManager.create(ctx.cwd);
+			settings.setProjectTrusted(ctx.isProjectTrusted());
+			await settings.reload();
+			shellCommandPrefix = settings.getShellCommandPrefix();
+		} catch (e) {
+			ctx.ui.notify(`Sandbox shellCommandPrefix config load failed: ${e instanceof Error ? e.message : e}`, "warning");
+		}
+
 		const noSandbox = pi.getFlag("no-sandbox") as boolean;
 
 		if (noSandbox) {
@@ -233,7 +253,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const config = loadConfig(ctx.cwd);
+		const config = loadConfig(ctx.cwd, (msg) => ctx.ui.notify(msg, "warning"));
 
 		if (!config.enabled) {
 			sandboxEnabled = false;
@@ -310,10 +330,11 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const config = loadConfig(ctx.cwd);
+			const config = loadConfig(ctx.cwd, (msg) => ctx.ui.notify(msg, "warning"));
 			const lines = [
 				"Sandbox Configuration:",
 				"",
+				`Enabled: ${config?.enabled || true}`,
 				"Network:",
 				`  Allowed: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
 				`  Denied: ${config.network?.deniedDomains?.join(", ") || "(none)"}`,
