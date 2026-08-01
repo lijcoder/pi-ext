@@ -1,9 +1,12 @@
 /**
- * Sandbox Extension - OS-level sandboxing for bash commands
+ * Sandbox Extension - OS-level sandboxing for bash + tool_call path rules for file tools
  *
- * Uses @anthropic-ai/sandbox-runtime to enforce filesystem and network
- * restrictions on bash commands at the OS level (sandbox-exec on macOS,
- * bubblewrap on Linux).
+ * Two layers:
+ * 1. bash commands run wrapped by @anthropic-ai/sandbox-runtime at the OS level
+ *    (sandbox-exec on macOS, bubblewrap on Linux).
+ * 2. read/grep/find/ls/write/edit are intercepted via the `tool_call` event and
+ *    their paths checked against the same filesystem rules (denyRead for reads,
+ *    denyWrite + allowWrite for writes), returning a clear block reason.
  *
  * Note: this example intentionally overrides the built-in `bash` tool to show
  * how built-in tools can be replaced. Alternatively, you could sandbox `bash`
@@ -43,13 +46,21 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve, sep } from "node:path";
 import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { type BashOperations, CONFIG_DIR_NAME, createBashTool, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { type BashOperations, CONFIG_DIR_NAME, createBashTool, getAgentDir, isToolCallEventType, SettingsManager } from "@earendil-works/pi-coding-agent";
 
 interface SandboxConfig extends SandboxRuntimeConfig {
 	enabled?: boolean;
+}
+
+/** Filesystem rules snapshot used by the tool_call interception layer. */
+interface FsRules {
+	denyRead: string[];
+	allowWrite: string[];
+	denyWrite: string[];
 }
 
 const DEFAULT_CONFIG: SandboxConfig = {
@@ -120,6 +131,93 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
 	}
 
 	return result;
+}
+
+// ---------------------------------------------------------------------------
+// tool_call path rules (Layer: in-process read/write interception)
+// ---------------------------------------------------------------------------
+
+function hasGlobChars(p: string): boolean {
+	return p.includes("*") || p.includes("?") || p.includes("{") || p.includes("[");
+}
+
+/** Convert a glob (with *, **, ?) to an anchored regex. */
+function globToRegExp(glob: string): RegExp {
+	let re = "";
+	for (let i = 0; i < glob.length; i++) {
+		const c = glob[i];
+		if (c === "*") {
+			if (glob[i + 1] === "*") {
+				if (glob[i + 2] === "/") {
+					re += "(?:.*/)?"; // **/ spans zero or more directories
+					i += 2;
+				} else {
+					re += ".*"; // bare ** crosses path separators
+					i++;
+				}
+			} else {
+				re += "[^/]*";
+			}
+		} else if (c === "?") {
+			re += "[^/]";
+		} else if ("\\^$.|+()[]{}".includes(c)) {
+			re += "\\" + c;
+		} else {
+			re += c;
+		}
+	}
+	return new RegExp("^" + re + "$");
+}
+
+/** Expand ~ and resolve a path (rule pattern or tool target) against cwd. */
+function normalizeRulePath(raw: string, cwd: string): string {
+	if (raw === "~") return homedir();
+	if (raw.startsWith("~/")) return join(homedir(), raw.slice(2));
+	return resolve(cwd, raw);
+}
+
+/**
+ * Does `target` match `pattern`? Literal patterns match the path itself and
+ * everything below it (mirroring sandbox-exec subpath semantics). Glob
+ * patterns match the path or any of its ancestor directories.
+ */
+function matchesRule(target: string, pattern: string, cwd: string): boolean {
+	const p = normalizeRulePath(pattern, cwd);
+	if (hasGlobChars(p)) {
+		const re = globToRegExp(p);
+		if (re.test(target)) return true;
+		let dir = dirname(target);
+		while (dir !== dirname(dir)) {
+			if (re.test(dir)) return true;
+			dir = dirname(dir);
+		}
+		return false;
+	}
+	return target === p || target.startsWith(p + sep);
+}
+
+/** Returns a blocking reason, or undefined if the path is allowed. */
+function checkPathRules(rawPath: string, verb: "read" | "write", cwd: string, rules: FsRules): string | undefined {
+	const target = normalizeRulePath(rawPath, cwd);
+
+	if (verb === "read") {
+		for (const pattern of rules.denyRead) {
+			if (matchesRule(target, pattern, cwd)) {
+				return `read: ${rawPath}: Operation not permitted`;
+			}
+		}
+		return undefined;
+	}
+
+	for (const pattern of rules.denyWrite) {
+		if (matchesRule(target, pattern, cwd)) {
+			return `write: ${rawPath}: Operation not permitted`;
+		}
+	}
+	if (rules.allowWrite.length > 0 && !rules.allowWrite.some((p) => matchesRule(target, p, cwd))) {
+		return `write: ${rawPath}: Operation not permitted (outside the allowed directories)`;
+	}
+	return undefined;
 }
 
 function createSandboxedBashOps(): BashOperations {
@@ -203,6 +301,7 @@ export default function (pi: ExtensionAPI) {
 
 	let sandboxEnabled = false;
 	let sandboxInitialized = false;
+	let activeRules: FsRules | undefined;
 	// Cached SettingsManager + captured prefix, refreshed once per session
 	// (session_start fires on startup and /reload — same lifecycle point where
 	// pi itself reloads settings). Tool execution only touches in-memory values,
@@ -223,6 +322,43 @@ export default function (pi: ExtensionAPI) {
 			});
 			return bash.execute(id, params, signal, onUpdate);
 		},
+	});
+
+	// Layer: in-process path-rule interception for the file tools
+	// (read/grep/find/ls -> denyRead; write/edit -> denyWrite + allowWrite).
+	// bash is intentionally excluded: its command text is not reliably
+	// parseable, and the OS-level sandbox already enforces the same rules.
+	// Rules follow the sandbox switch: disabled/unsupported -> no interception.
+	pi.on("tool_call", async (event, ctx) => {
+		if (!sandboxEnabled || !activeRules) return;
+
+		let rawPath: string | undefined;
+		let verb: "read" | "write" | undefined;
+
+		if (isToolCallEventType("read", event)) {
+			rawPath = event.input.path;
+			verb = "read";
+		} else if (isToolCallEventType("grep", event)) {
+			// path defaults to the current directory when omitted
+			rawPath = event.input.path ?? ctx.cwd;
+			verb = "read";
+		} else if (isToolCallEventType("find", event)) {
+			rawPath = event.input.path ?? ctx.cwd;
+			verb = "read";
+		} else if (isToolCallEventType("ls", event)) {
+			rawPath = event.input.path ?? ctx.cwd;
+			verb = "read";
+		} else if (isToolCallEventType("write", event)) {
+			rawPath = event.input.path;
+			verb = "write";
+		} else if (isToolCallEventType("edit", event)) {
+			rawPath = event.input.path;
+			verb = "write";
+		}
+		if (!rawPath || !verb) return;
+
+		const reason = checkPathRules(rawPath, verb, ctx.cwd, activeRules);
+		if (reason) return { block: true, reason };
 	});
 
 	pi.on("user_bash", () => {
@@ -249,6 +385,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (noSandbox) {
 			sandboxEnabled = false;
+			activeRules = undefined;
 			ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
 			return;
 		}
@@ -257,13 +394,26 @@ export default function (pi: ExtensionAPI) {
 
 		if (!config.enabled) {
 			sandboxEnabled = false;
+			activeRules = undefined;
 			ctx.ui.notify("Sandbox disabled via config", "info");
 			return;
 		}
 
+		// Snapshot the path rules for the tool_call layer. They are only
+		// evaluated while sandboxEnabled is true (see the tool_call handler),
+		// so the disable paths below reset them to undefined.
+		activeRules = config.filesystem
+			? {
+					denyRead: config.filesystem.denyRead ?? [],
+					allowWrite: config.filesystem.allowWrite ?? [],
+					denyWrite: config.filesystem.denyWrite ?? [],
+				}
+			: undefined;
+
 		const platform = process.platform;
 		if (platform !== "darwin" && platform !== "linux") {
 			sandboxEnabled = false;
+			activeRules = undefined;
 			ctx.ui.notify(`Sandbox not supported on ${platform}`, "warning");
 			return;
 		}
@@ -308,6 +458,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("Sandbox initialized", "info");
 		} catch (err) {
 			sandboxEnabled = false;
+			activeRules = undefined;
 			ctx.ui.notify(`Sandbox initialization failed: ${err instanceof Error ? err.message : err}`, "error");
 		}
 	});
@@ -335,6 +486,8 @@ export default function (pi: ExtensionAPI) {
 				"Sandbox Configuration:",
 				"",
 				`Enabled: ${config?.enabled || true}`,
+				"ToolCall interception (read/grep/find/ls -> denyRead, write/edit -> denyWrite+allowWrite):",
+				`  Active: ${sandboxEnabled && activeRules ? "yes" : "no"}`,
 				"Network:",
 				`  Allowed: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
 				`  Denied: ${config.network?.deniedDomains?.join(", ") || "(none)"}`,
